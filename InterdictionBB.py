@@ -5,12 +5,11 @@ try:
     from src.gimpy import Tree
 except ImportError:
     from coinor.gimpy import Tree
-import time
 try:
     from src.blimpy import PriorityQueue
 except ImportError:
     from coinor.blimpy import PriorityQueue
-#from pygame.transform import scale
+import time
 from pulp import LpVariable, lpSum, LpProblem, LpMaximize, LpMinimize, LpConstraint
 from pulp import LpStatus, value, LpBinary
 
@@ -54,7 +53,7 @@ else:
 # parent of root node.
 DUMMY_NODE = 'dummy_node'
 # branching strategies
-MOST_FRACTIONAL = 'Most Fraction'
+MOST_FRACTIONAL = 'Most Fractional'
 INTERDICTION_BRANCHING = 'Interdiction Branching'
 # search strategies
 DEPTH_FIRST = 'Depth First'
@@ -62,6 +61,7 @@ BEST_FIRST = 'Best First'
 BEST_ESTIMATE = 'Best Estimate'
 INFINITY = sys.maxint
 
+etol = 1e-7
 
 class InterdictionTree(Tree):
     
@@ -70,6 +70,7 @@ class InterdictionTree(Tree):
         self._incumbent_value = None
         self.branch_strategy = INTERDICTION_BRANCHING
         self.search_strategy = BEST_FIRST
+        self.branch_on_fractional = False
         if self.get_layout() == 'dot2tex':
             print "Dot2Tex not supported..."
             self.display_mode = 'off'
@@ -114,6 +115,7 @@ class InterdictionTree(Tree):
         
         # The number of LP's solved, and the number of nodes solved
         self.node_count = 1
+        self.real_node_count = 1
         iter_count = 0
         lp_count = 0
         self.var   = LpVariable.dicts("", self.VARIABLES, 0, 1)
@@ -164,11 +166,13 @@ class InterdictionTree(Tree):
             print ""
             print "----------------------------------------------------"
             print ""
-            print "Node: %s, Depth: %s, LB: %s" %(cur_index,cur_depth,
-                                                  self.incumbent_value)
-            if relax is not None and relax <= self.incumbent_value + 1:
+            print "Node: %s, Depth: %s, LB: %s" %(cur_index, cur_depth,
+                                                  self._incumbent_value)
+            if (relax is not None and self._incumbent_value is not None and
+                relax <= self._incumbent_value + 1 - etol):
                 print "Node pruned immediately by bound"
                 self.set_node_attr(parent, 'color', 'red')
+                self.real_node_count -= 1
                 continue
 
             #====================================
@@ -190,7 +194,7 @@ class InterdictionTree(Tree):
                     pred_branch_var_set = self.get_node_attr(pred, 'branch_var_set')
                     branch_var_set.update(pred_branch_var_set)
                     pred = self.get_node_attr(pred, 'parent')
-            print "Branching variables set:"
+            print "Branching set:"
             print branch_var_set
             # Compute lower bound by LP relaxation
             self.ADJ_RHS = dict((i, self.RHS[i]) for i in self.CONSTRAINTS)
@@ -203,7 +207,8 @@ class InterdictionTree(Tree):
             for j in branch_var_set:
                 if branch_var_set[j] == 1:
                     OBJ_OFFSET += self.OBJ[j]
-            print OBJ_OFFSET 
+            if debug_print: 
+                print 'Objective offset: ', OBJ_OFFSET 
             if FREE_VARIABLES != []:
                 self.LpRelaxation = LpProblem("relax", LpMaximize)
                 self.LpRelaxation += lpSum([self.OBJ[j]*self.var[j] for j in FREE_VARIABLES]), "Objective"
@@ -254,11 +259,14 @@ class InterdictionTree(Tree):
                 var_values = dict([(i, self.var[i].varValue) for i in FREE_VARIABLES])
                 integer_solution = True
                 for i in FREE_VARIABLES:
-                    if (var_values[i] not in set([0,1])):
+                    if (var_values[i] > etol and var_values[i] < 1 - etol):
                         integer_solution = False
                         break
-                if (integer_solution and relax > self.incumbent_value):
-                    self.incumbent_value = relax
+                if (integer_solution and (self._incumbent_value is None or 
+                    relax > self._incumbent_value)):
+                    self._incumbent_value = relax
+                    self._incumbent_parent = -1
+                    self._new_integer_solution = True
                     opt = dict([(i, 0) for i in self.VARIABLES])
                     for i in FREE_VARIABLES:
                         # These two have different data structures first one
@@ -271,19 +279,19 @@ class InterdictionTree(Tree):
                     for i in FREE_VARIABLES:
                         if var_values[i] > 0:
                             print "%s = %s" %(i, var_values[i])
-                elif (integer_solution and relax<=self.incumbent_value):
+                elif integer_solution:
                     print "New integer solution found, objective: %s" %relax
                     for i in FREE_VARIABLES:
                         if var_values[i] > 0:
                             print "%s = %s" %(i, var_values[i])
                 else:
-                    print "Fractional solution:"
+                    print "Fractional solution (free variables):"
                     for i in FREE_VARIABLES:
                         if var_values[i] > 0:
                             print "%s = %s" %(i, var_values[i])
                 #For complete enumeration
                 if complete_enumeration:
-                    relax = self.incumbent_value - 1
+                    relax = self._incumbent_value - 1
             if integer_solution:
                 print "Integer solution"
                 BBstatus = 'S'
@@ -294,8 +302,10 @@ class InterdictionTree(Tree):
                 BBstatus = 'I'
                 status = 'infeasible'
                 color = 'orange'
-            elif not complete_enumeration and relax <= self.incumbent_value + 0.99:
-                print "Node pruned by bound (obj: %s, LB: %s)" %(relax,self.incumbent_value)
+            elif (not complete_enumeration and self._incumbent_value is not None and 
+                  relax <= self._incumbent_value + 1 - etol):
+                print "Node pruned by bound (obj: %s, LB: %s)" %(relax,
+                                                                 str(self._incumbent_value))
                 BBstatus = 'P'
                 status = 'fathomed'
                 color = 'red'
@@ -332,12 +342,14 @@ class InterdictionTree(Tree):
                     if self._incumbent_value is None:
                         print 'WARNING: Encountered "fathom" line before '+\
                             'first incumbent.'
+#                self.AddOrUpdateNode(0, DUMMY_NODE, None, 'candidate', relax,
+#                                 integer_infeasibility_count,
+#                                 integer_infeasibility_sum,
+#                                 label = label,
+#                                 obj = relax, color = color,
+#                                 style = 'filled', fillcolor = color)
                 self.add_root(0, status = status, label = label, obj = relax, 
                               color = color, style = 'filled', fillcolor = color)
-                if status is 'integer':
-                    self._incumbent_value = relax
-                    self._incumbent_parent = -1
-                    self._new_integer_solution = True
                 if ETREE_INSTALLED and self.attr['display'] == 'svg':
                     self.write_as_svg(filename = "node%d" % iter_count,
                                       nextfile = "node%d" % (iter_count + 1),
@@ -350,14 +362,19 @@ class InterdictionTree(Tree):
                         print 'WARNING: Encountered "fathom" line before'+\
                             ' first incumbent.'
                         print '  This may indicate an error in the input file.'
+#                self.AddOrUpdateNode(cur_index, parent, _direction[sense],
+#                                     status, relax,
+#                                     integer_infeasibility_count,
+#                                     integer_infeasibility_sum,
+#                                     branch_var = branch_var,
+#                                     branch_var_value = var_values[branch_var],
+#                                     sense = sense, rhs = rhs, obj = relax,
+#                                     color = color, style = 'filled',
+#                                     label = label, fillcolor = color)
                 self.add_child(cur_index, parent, status = status,
                                branch_var_set = branch_var_set, obj = relax,
                                color = color, style = 'filled',
                                label = label, fillcolor = color)
-                if status is 'integer':
-                    self._incumbent_value = relax
-                    self._incumbent_parent = parent
-                    self._new_integer_solution = True
                 if ETREE_INSTALLED and self.attr['display'] == 'svg':
                     self.write_as_svg(filename = "node%d" % iter_count,
                                       prevfile = "node%d" % (iter_count - 1),
@@ -365,7 +382,7 @@ class InterdictionTree(Tree):
                                       highlight = cur_index)
             if BBstatus is 'C':
                 self.CreateNewNodes(branch_var_list, found_ISC, cur_index)
-                self.set_node_attr(cur_index, color, 'green')
+                #self.set_node_attr(cur_index, 'fillcolor', 'green')
 
             if iter_count is not 0:
                 if var_set_to_one is not -1:
@@ -395,7 +412,7 @@ class InterdictionTree(Tree):
         print "Strategy: %s" %self.branch_strategy
         if complete_enumeration:
             print "Complete enumeration"
-        print "%s nodes visited " %self.node_count
+        print "%s nodes visited " %self.real_node_count
         print "%s LP's solved" %lp_count
         print "==========================================="
         print "Optimal solution"
@@ -404,28 +421,43 @@ class InterdictionTree(Tree):
             if opt[i] > 0:
                 print "%s = %s" %(i, opt[i])
         print "Objective function value"
-        print self.incumbent_value
+        print self._incumbent_value
         print "==========================================="
         if self.attr['display'] is not 'off':
             self.display()
         self._lp_count = lp_count
-        return opt, self.incumbent_value
+        return opt, self._incumbent_value, self.real_node_count
 
-    def Branch(self, FREE_VARIABLES, OBJ_OFFSET, debug_print):
+    def Branch(self, FREE_VARIABLES , OBJ_OFFSET, debug_print):
         # Choose a branching set
         found_ISC = False
-        if self.branch_strategy is INTERDICTION_BRANCHING and self.incumbent_value > 0:
+        if (self.branch_strategy is INTERDICTION_BRANCHING and self._incumbent_value is not None and
+            self._incumbent_value > 0):
             M = 100
+            if self.branch_on_fractional:
+                BRANCH_VARIABLES = [i for i in FREE_VARIABLES if (self.var[i].varValue > etol and
+                                                                  self.var[i].varValue < 1-etol)]
+                NO_BRANCH_VARIABLES = [i for i in FREE_VARIABLES if (self.var[i].varValue < etol or
+                                                                     self.var[i].varValue > 1-etol)]
+            else:
+                BRANCH_VARIABLES = FREE_VARIABLES
+                NO_BRANCH_VARIABLES = [] 
             interdict_prob = LpProblem("interdict", LpMinimize)
-            interdict_vars = LpVariable.dicts("y", FREE_VARIABLES, 0, 1, LpBinary)
+            interdict_vars = LpVariable.dicts("y", BRANCH_VARIABLES , 0, 1, LpBinary)
             cons_dual_vars = LpVariable.dicts("u", self.CONSTRAINTS, 0)
-            bound_dual_vars = LpVariable.dicts("w", FREE_VARIABLES, 0)
-            interdict_prob += lpSum(interdict_vars[i] for i in FREE_VARIABLES), "Objective"
+            bound_dual_vars = LpVariable.dicts("w", FREE_VARIABLES , 0)
+            interdict_prob += lpSum(interdict_vars[i] for i in BRANCH_VARIABLES ), "Objective"
             interdict_prob += (lpSum(cons_dual_vars[i]*self.ADJ_RHS[i] for i in self.CONSTRAINTS) 
-                               + lpSum(bound_dual_vars[j] for j in FREE_VARIABLES) <= self.incumbent_value - OBJ_OFFSET - 1, "Bound")
-            for j in FREE_VARIABLES:
-                interdict_prob += (lpSum(cons_dual_vars[i]*self.MAT[i, j] for i in self.CONSTRAINTS) 
+                               + lpSum(bound_dual_vars[j] for j in FREE_VARIABLES ) <= self._incumbent_value - OBJ_OFFSET - 1, "Bound")
+            for j in BRANCH_VARIABLES:
+                try:
+                    interdict_prob += (lpSum(cons_dual_vars[i]*self.MAT[i, j] for i in self.CONSTRAINTS) 
                                    + bound_dual_vars[j] >= self.OBJ[j] - M*interdict_vars[j])
+                except:
+                    pass
+            for j in NO_BRANCH_VARIABLES:
+                interdict_prob += (lpSum(cons_dual_vars[i]*self.MAT[i, j] for i in self.CONSTRAINTS) 
+                                   + bound_dual_vars[j] >= self.OBJ[j])
             interdict_status = interdict_prob.solve()
             if LpStatus[interdict_status] == 'Optimal':
                 if debug_print:
@@ -475,6 +507,7 @@ class InterdictionTree(Tree):
             self.Q.push(self.node_count, (self.node_count, parent, 
                                           bound, branch_var_set), priority)
             self.node_count += 1
+            self.real_node_count += 1
         if found_ISC is False:
             # This is the all-zeros branch that we discard in the interdiction case
             branch_var_set = {}
@@ -483,19 +516,63 @@ class InterdictionTree(Tree):
             self.Q.push(self.node_count, (self.node_count, parent, 
                                           bound, branch_var_set), priority)
             self.node_count += 1
+            self.real_node_count += 1
+        if found_ISC is True and len(branch_var_set) == 1:
+            self.real_node_count -= 1
+            
     
 if __name__ == '__main__':
+#    '''
     T = InterdictionTree()
     T.set_display_mode('xdot')
+    
+    numV = 40
+    numC = 20
+    VARS = range(numV)
+    CONS = ["C"+str(i) for i in range(numC)]
 
+    #Generate random MILP
+    T.GenerateRandomMILP(VARS, CONS, rand_seed = 2)
+    #T.branch_on_fractional = False
+    T.branch_strategy = MOST_FRACTIONAL
+    #T.incumbent_value = 213
+    T.BranchAndBound()
+#    '''
+'''
     numV = 40
     numC = 20
     VARS = dict((i, 0) for i in range(numV))
     CONS = ["C"+str(i) for i in range(numC)]
+    opt = []
+    nodes = []
+    for i in range(10):
+        T = InterdictionTree()
+        T.set_display_mode('off')
+        #Generate random MILP
+        T.GenerateRandomMILP(VARS, CONS, rand_seed = i)
+        T.branch_strategy = MOST_FRACTIONAL
+        #T.incumbent_value = 218
+        sol, solval, node_nobound_frac = T.BranchAndBound()
+        opt.append(solval)
+        
+        T = InterdictionTree()
+        T.set_display_mode('off')
+        #Generate random MILP
+        T.GenerateRandomMILP(VARS, CONS, rand_seed = i)
+        T.branch_strategy = MOST_FRACTIONAL
+        T.incumbent_value = opt[i]
+        solval, sol, node_bound_frac = T.BranchAndBound()
+        
+        T = InterdictionTree()
+        T.set_display_mode('off')
+        #Generate random MILP
+        T.GenerateRandomMILP(VARS, CONS, rand_seed = i)
+        T.branch_strategy = INTERDICTION_BRANCHING
+        T.branch_on_fractional = True
+        T.incumbent_value = opt[i]
+        solval, sol, node_bound_interdict = T.BranchAndBound()
+        
+        nodes.append((node_nobound_frac, node_bound_frac, node_bound_interdict))
 
-    #Generate random MILP
-    T.GenerateRandomMILP(VARS, CONS, rand_seed = 3)
-    #T.branch_strategy = MOST_FRACTIONAL
-    T.incumbent_value = 213
-
-    T.BranchAndBound()
+    print nodes
+'''

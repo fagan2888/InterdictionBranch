@@ -10,45 +10,11 @@ try:
 except ImportError:
     from coinor.blimpy import PriorityQueue
 import time
-from pulp import LpVariable, lpSum, LpProblem, LpMaximize, LpMinimize, LpConstraint
-from pulp import LpStatus, value, LpBinary
-
-try:
-    import pygame # for locals.QUIT, locals.KEYDOWN,display,image,event,init
-except ImportError:
-    PYGAME_INSTALLED = False
-else:
-    PYGAME_INSTALLED = True
-
-try:
-    import dot2tex # for dot2tex method
-except ImportError:
-    DOT2TEX_INSTALLED = False
-else:
-    DOT2TEX_INSTALLED = True
-
-try:
-    from PIL import Image as PIL_Image
-except ImportError:
-    PIL_INSTALLED = False
-else:
-    PIL_INSTALLED = True
-
-try:
-    import pygtk
-    import gtk
-    import xdot
-except ImportError:
-    XDOT_INSTALLED = False
-else:
-    XDOT_INSTALLED = True
-
-try:
-    import lxml # for etree
-except ImportError:
-    ETREE_INSTALLED = False
-else:
-    ETREE_INSTALLED = True
+from cylp.cy import CyClpSimplex
+from cylp.py.modeling import CyLPArray, CyLPModel
+import importlib as ilib
+import numpy as np
+from scipy import sparse
 
 # parent of root node.
 DUMMY_NODE = 'dummy_node'
@@ -107,7 +73,8 @@ class InterdictionTree(Tree):
                                   for i in CONSTRAINTS)
     
     def BranchAndBound(self, complete_enumeration = False,
-                       display_interval = None, debug_print = False):
+                       display_interval = None, debug_print = False,
+                       max_iter_num = 100000):
 
         #====================================
         # Initialize
@@ -118,10 +85,12 @@ class InterdictionTree(Tree):
         self.real_node_count = 1
         iter_count = 0
         lp_count = 0
-        self.var   = LpVariable.dicts("", self.VARIABLES, 0, 1)
-        numVars = len(self.VARIABLES)
+        numVars = len(self.OBJ)
+        numCons = len(self.RHS)
+        sense = self.SENSE[1]
+        INFINITY = CyClpSimplex().getCoinInfinity()
+        opt = None
         # List of incumbent solution variable values
-        opt = dict([(i, 0) for i in self.VARIABLES])
         print "==========================================="
         print "Starting Branch and Bound"
         if self.branch_strategy is MOST_FRACTIONAL:
@@ -144,13 +113,17 @@ class InterdictionTree(Tree):
         cur_index = 0
         # Timer
         timer = time.time()
-        self.Q.push(0, (0, None, None, None), 0)
+        self.Q.push(0, -INFINITY, (0, None, None, None))
 
         #====================================
         # Main Loop
         #====================================
 
         while not self.Q.isEmpty():
+            
+            if iter_count >= max_iter_num:
+                print "Maximum iterations reached..."
+                break
 
             #====================================
             # Set Up
@@ -166,10 +139,14 @@ class InterdictionTree(Tree):
             print ""
             print "----------------------------------------------------"
             print ""
-            print "Node: %s, Depth: %s, LB: %s" %(cur_index, cur_depth,
-                                                  self._incumbent_value)
+            print "Node: %s, Depth: %s, " %(cur_index, cur_depth),
+            if self.SENSE[0] == 'Max':
+                print "LB: %s" %(self._incumbent_value)
+            else:
+                print "UB: %s" %(self._incumbent_value)
             if (relax is not None and self._incumbent_value is not None and
-                relax <= self._incumbent_value + 1 - etol):
+                ((self.SENSE[0] == 'Max' and relax <= self._incumbent_value + 1 - etol) or
+                 (self.SENSE[0] == 'Min' and relax >= self._incumbent_value - 1 + etol))):
                 print "Node pruned immediately by bound"
                 self.set_node_attr(parent, 'color', 'red')
                 self.real_node_count -= 1
@@ -197,55 +174,67 @@ class InterdictionTree(Tree):
             print "Branching set:"
             print branch_var_set
             # Compute lower bound by LP relaxation
-            self.ADJ_RHS = dict((i, self.RHS[i]) for i in self.CONSTRAINTS)
-            for j in branch_var_set:
-                if branch_var_set[j] == 1:
-                    for i in self.CONSTRAINTS:
-                        self.ADJ_RHS[i] -= self.MAT[i, j]
-            FREE_VARIABLES = [i for i in self.VARIABLES if i not in branch_var_set]
-            OBJ_OFFSET = 0
-            for j in branch_var_set:
-                if branch_var_set[j] == 1:
-                    OBJ_OFFSET += self.OBJ[j]
-            if debug_print: 
-                print 'Objective offset: ', OBJ_OFFSET 
-            if FREE_VARIABLES != []:
-                self.LpRelaxation = LpProblem("relax", LpMaximize)
-                self.LpRelaxation += lpSum([self.OBJ[j]*self.var[j] for j in FREE_VARIABLES]), "Objective"
-                for i in self.CONSTRAINTS:
-                    self.LpRelaxation += lpSum([self.MAT[i, j]*self.var[j] for j in FREE_VARIABLES]) <= self.ADJ_RHS[i], i
-                # Solve the LP relaxation
-                status = self.LpRelaxation.solve()
-                lp_count = lp_count +1
+            self.ADJ_RHS = CyLPArray(self.RHS)
+            eliminate_fixed = True
+            if (eliminate_fixed):
+                for j in branch_var_set:
+                    if branch_var_set[j] == 1:
+                        for i in self.MAT.getcol(j).indices:
+                            print self.RHS[i], self.ADJ_RHS[i], self.MAT[i,j] 
+                            self.ADJ_RHS[i] -= self.MAT[i,j]
+                            print self.RHS[i], self.ADJ_RHS[i] 
+                            
+                OBJ_OFFSET = sum([self.OBJ[j] for j in branch_var_set if branch_var_set[j] == 1])
+                k = 0
+                FREE_VARIABLES = {}
+                for i in range(numVars):
+                    if i not in branch_var_set:
+                        FREE_VARIABLES[i] = k
+                        k += 1
+                if debug_print: 
+                    print 'Objective offset: ', OBJ_OFFSET 
+            else:
+                OBJ_OFFSET = 0
+                FREE_VARIABLES = {(i, i) for i in range(numVars)}
+            if FREE_VARIABLES != {}:
+                lp = CyClpSimplex()
+                A = self.MAT[:,FREE_VARIABLES.keys()]
+                b = CyLPArray(self.ADJ_RHS)
+                x = lp.addVariable('x', len(FREE_VARIABLES))
+                lp += 0 <= x <= 1
+                if not eliminate_fixed:
+                    for j in branch_var_set:
+                        lp += x[j] == branch_var_set[j]
+                for i in range(numCons):
+                    if sense[i] == '<=':
+                        lp += -A.getrow(i) * x >= -self.ADJ_RHS[i]
+                    elif sense[i] == '>=':
+                        lp += A.getrow(i) * x >= self.ADJ_RHS[i]
+                    else:
+                        lp += A.getrow(i) * x == self.ADJ_RHS[i]                         
+                c = CyLPArray([self.OBJ[j] for j in FREE_VARIABLES])
+                lp.objective = -c * x if self.SENSE[0] == 'Max' else c * x
+                lp.primal(startFinishOptions = 'x')
+                lp_count = lp_count + 1
+                status = lp.getStatusCode()
                 # Check infeasibility
-                infeasible = LpStatus[status] == "Infeasible" or \
-                    LpStatus[status] == "Undefined"
+                infeasible = (status == 1)
+                
                 if debug_print:
-                    print "Duals on constraints in LP relaxation:"
-                    for i in self.CONSTRAINTS:
-                        print i, self.LpRelaxation.constraints[i].pi
-                    print "Reduced costs on variables in LP relaxation:"
-                    for j in FREE_VARIABLES:
-                        print j, self.var[j].dj
-                    print "Dual solution value:",
-                    print value(lpSum(self.LpRelaxation.constraints[i].pi*self.ADJ_RHS[i] 
-                                      for i in self.CONSTRAINTS 
-                                      if self.LpRelaxation.constraints[i].pi is not None) +
-                                lpSum(self.var[j].dj for j in FREE_VARIABLES 
-                                      if self.var[j].dj > .00001) +
-                                OBJ_OFFSET)
+                    print "Duals on constraints in LP relaxation:", lp.dualConstraintSolution
+                    print "Reduced costs on variables in LP relaxation:", lp.reducedCosts
                 if not infeasible:
-                    relax = value(self.LpRelaxation.objective) + OBJ_OFFSET
+                    relax = lp.objectiveValue + OBJ_OFFSET
             else:
                 print "All variables fixed...no LP to solve" 
                 infeasible = False
-                for i in self.CONSTRAINTS:
-                    if self.ADJ_RHS[i] < 0:
+                for i in self.ADJ_RHS:
+                    if i < 0:
                         infeasible = True
                         break
                 if not infeasible:
                     relax = OBJ_OFFSET
-                    
+            
             #====================================
             # Process Result
             #====================================
@@ -256,42 +245,37 @@ class InterdictionTree(Tree):
                 relax = 0
             else:
                 print "Node status: feasible with obj = %s" %relax
-                var_values = dict([(i, self.var[i].varValue) for i in FREE_VARIABLES])
-                integer_solution = True
-                for i in FREE_VARIABLES:
-                    if (var_values[i] > etol and var_values[i] < 1 - etol):
-                        integer_solution = False
-                        break
-                if (integer_solution and (self._incumbent_value is None or 
-                    relax > self._incumbent_value)):
+                self.sol = lp.primalVariableSolution['x']
+                if isInt(self.sol):
+                    integer_solution = True
+                else:
+                    integer_solution = False
+                if (integer_solution and 
+                    (self._incumbent_value is None or 
+                    (self.SENSE[0] == 'Max' and relax > self._incumbent_value) or
+                    (self.SENSE[0] == 'Min' and relax < self._incumbent_value))):
                     self._incumbent_value = relax
                     self._incumbent_parent = -1
                     self._new_integer_solution = True
-                    opt = dict([(i, 0) for i in self.VARIABLES])
+                    opt = np.zeros(numVars)
                     for i in FREE_VARIABLES:
-                        # These two have different data structures first one
-                        #list, second one dictionary
-                        opt[i] = var_values[i]
+                        opt[i] = self.sol[FREE_VARIABLES[i]]
                     for i in branch_var_set:
-                        if branch_var_set[i] == 1:
-                            opt[i] = 1
+                        opt[i] = branch_var_set[i]
                     print "New best solution found, objective: %s" %relax
-                    for i in FREE_VARIABLES:
-                        if var_values[i] > 0:
-                            print "%s = %s" %(i, var_values[i])
                 elif integer_solution:
                     print "New integer solution found, objective: %s" %relax
-                    for i in FREE_VARIABLES:
-                        if var_values[i] > 0:
-                            print "%s = %s" %(i, var_values[i])
                 else:
                     print "Fractional solution (free variables):"
-                    for i in FREE_VARIABLES:
-                        if var_values[i] > 0:
-                            print "%s = %s" %(i, var_values[i])
+                for i in FREE_VARIABLES:
+                    if self.sol[FREE_VARIABLES[i]] > 0:
+                        print "x_%s = %s" %(i, self.sol[FREE_VARIABLES[i]])
                 #For complete enumeration
                 if complete_enumeration:
-                    relax = self._incumbent_value - 1
+                    if self.SENSE[1] == 'Max':
+                        relax = self._incumbent_value - 1
+                    else:
+                        relax = self._incumbent_value + 1
             if integer_solution:
                 print "Integer solution"
                 BBstatus = 'S'
@@ -302,9 +286,15 @@ class InterdictionTree(Tree):
                 BBstatus = 'I'
                 status = 'infeasible'
                 color = 'orange'
-            elif (not complete_enumeration and self._incumbent_value is not None and 
-                  relax <= self._incumbent_value + 1 - etol):
-                print "Node pruned by bound (obj: %s, LB: %s)" %(relax,
+            elif (not complete_enumeration and 
+                  self._incumbent_value is not None and 
+                  ((self.SENSE[0] == 'Max' and relax <= self._incumbent_value - etol) or
+                   (self.SENSE[0] == 'Min' and relax >= self._incumbent_value + etol))):
+                if self.SENSE[0] == 'Max':
+                    print "Node pruned by bound (obj: %s, LB: %s)" %(relax,
+                                                                 str(self._incumbent_value))
+                else:
+                    print "Node pruned by bound (obj: %s, UB: %s)" %(relax,
                                                                  str(self._incumbent_value))
                 BBstatus = 'P'
                 status = 'fathomed'
@@ -328,10 +318,15 @@ class InterdictionTree(Tree):
             #====================================
             # Branch
             #====================================
-            
+
             if BBstatus is 'C':
                 branch_var_list, found_ISC = self.Branch(FREE_VARIABLES, OBJ_OFFSET, debug_print)
                 label = label + "\n" + str(branch_var_list)
+                if branch_var_list == []:
+                    print "Node pruned because of empty cover!"
+                    BBstatus = 'P'
+                    status = 'fathomed'
+                    color = 'red'
 
             #====================================
             # Update Tree
@@ -350,10 +345,6 @@ class InterdictionTree(Tree):
 #                                 style = 'filled', fillcolor = color)
                 self.add_root(0, status = status, label = label, obj = relax, 
                               color = color, style = 'filled', fillcolor = color)
-                if ETREE_INSTALLED and self.attr['display'] == 'svg':
-                    self.write_as_svg(filename = "node%d" % iter_count,
-                                      nextfile = "node%d" % (iter_count + 1),
-                                      highlight = cur_index)
             else:
                 if status is 'infeasible':
                     relax = self.get_node_attr(parent, 'lp_bound')
@@ -375,11 +366,6 @@ class InterdictionTree(Tree):
                                branch_var_set = branch_var_set, obj = relax,
                                color = color, style = 'filled',
                                label = label, fillcolor = color)
-                if ETREE_INSTALLED and self.attr['display'] == 'svg':
-                    self.write_as_svg(filename = "node%d" % iter_count,
-                                      prevfile = "node%d" % (iter_count - 1),
-                                      nextfile = "node%d" % (iter_count + 1),
-                                      highlight = cur_index)
             if BBstatus is 'C':
                 self.CreateNewNodes(branch_var_list, found_ISC, cur_index)
                 #self.set_node_attr(cur_index, 'fillcolor', 'green')
@@ -415,77 +401,102 @@ class InterdictionTree(Tree):
         print "%s nodes visited " %self.real_node_count
         print "%s LP's solved" %lp_count
         print "==========================================="
-        print "Optimal solution"
         #print optimal solution
-        for i in sorted(self.VARIABLES):
-            if opt[i] > 0:
-                print "%s = %s" %(i, opt[i])
-        print "Objective function value"
-        print self._incumbent_value
-        print "==========================================="
         if self.attr['display'] is not 'off':
             self.display()
         self._lp_count = lp_count
-        return opt, self._incumbent_value, self.real_node_count
+        if self._incumbent_value:
+            if opt == None:
+                print "No improving solution found"
+            else:
+                print "Optimal solution"
+                for (i, val) in enumerate(opt):
+                    if val > 0:
+                        print "x_%s = %s" %(i, val)
+                print "Objective function value"
+                print "==========================================="
+                print self._incumbent_value
+            return opt, self._incumbent_value, self.real_node_count
+        else:
+            print "Problem infeasible"
+            print "==========================================="
+            return None, None, self.real_node_count
 
     def Branch(self, FREE_VARIABLES , OBJ_OFFSET, debug_print):
         # Choose a branching set
         found_ISC = False
-        if (self.branch_strategy is INTERDICTION_BRANCHING and self._incumbent_value is not None and
-            self._incumbent_value > 0):
-            M = 100
+        sense = self.SENSE[1]
+        if (self.branch_strategy == INTERDICTION_BRANCHING and self._incumbent_value is not None):
+            M = 100000
+            BRANCH_VARIABLES = {}
+            NO_BRANCH_VARIABLES = {}
             if self.branch_on_fractional:
-                BRANCH_VARIABLES = [i for i in FREE_VARIABLES if (self.var[i].varValue > etol and
-                                                                  self.var[i].varValue < 1-etol)]
-                NO_BRANCH_VARIABLES = [i for i in FREE_VARIABLES if (self.var[i].varValue < etol or
-                                                                     self.var[i].varValue > 1-etol)]
+                j, k = 0, 0
+                for i in FREE_VARIABLES:
+                    if isInt(self.sol[FREE_VARIABLES[i]]):
+                        NO_BRANCH_VARIABLES[i] = j
+                        j += 1 
+                    else:
+                        BRANCH_VARIABLES[i] = k
+                        k += 1
             else:
-                BRANCH_VARIABLES = FREE_VARIABLES
-                NO_BRANCH_VARIABLES = [] 
-            interdict_prob = LpProblem("interdict", LpMinimize)
-            interdict_vars = LpVariable.dicts("y", BRANCH_VARIABLES , 0, 1, LpBinary)
-            cons_dual_vars = LpVariable.dicts("u", self.CONSTRAINTS, 0)
-            bound_dual_vars = LpVariable.dicts("w", FREE_VARIABLES , 0)
-            interdict_prob += lpSum(interdict_vars[i] for i in BRANCH_VARIABLES ), "Objective"
-            interdict_prob += (lpSum(cons_dual_vars[i]*self.ADJ_RHS[i] for i in self.CONSTRAINTS) 
-                               + lpSum(bound_dual_vars[j] for j in FREE_VARIABLES ) <= self._incumbent_value - OBJ_OFFSET - 1, "Bound")
-            for j in BRANCH_VARIABLES:
-                try:
-                    interdict_prob += (lpSum(cons_dual_vars[i]*self.MAT[i, j] for i in self.CONSTRAINTS) 
-                                   + bound_dual_vars[j] >= self.OBJ[j] - M*interdict_vars[j])
-                except:
-                    pass
-            for j in NO_BRANCH_VARIABLES:
-                interdict_prob += (lpSum(cons_dual_vars[i]*self.MAT[i, j] for i in self.CONSTRAINTS) 
-                                   + bound_dual_vars[j] >= self.OBJ[j])
-            interdict_status = interdict_prob.solve()
-            if LpStatus[interdict_status] == 'Optimal':
+                j = 0
+                for i in FREE_VARIABLES:
+                    BRANCH_VARIABLES[i] = j
+                    j += 1
+            interdict_prob = CyLPModel()
+            y = interdict_prob.addVariable('y', len(BRANCH_VARIABLES), isInt = True) #binary
+            u = interdict_prob.addVariable('u', len(sense))
+            w = interdict_prob.addVariable('w', len(FREE_VARIABLES))
+            interdict_prob.objective = y.sum()
+            if self.SENSE[0] == 'Max':
+                interdict_prob += CyLPArray(self.ADJ_RHS)*u + w.sum() <= self._incumbent_value - OBJ_OFFSET
+                k = 0
+                for i in FREE_VARIABLES:
+                    try:
+                        interdict_prob += self.MAT.getcol(i).transpose()*u + w[FREE_VARIABLES[i]] + M*y[BRANCH_VARIABLES[i]] >= self.OBJ[i]
+                    except:
+                        interdict_prob += self.MAT.getcol(i).transpose()*u + w[FREE_VARIABLES[i]] >= self.OBJ[i]
+            else: 
+                interdict_prob += CyLPArray(self.ADJ_RHS)*u + w.sum() >= self._incumbent_value - OBJ_OFFSET 
+                k = 0
+                for i in FREE_VARIABLES:
+                    try:
+                        interdict_prob += self.MAT.getcol(i).transpose()*u + w[FREE_VARIABLES[i]] - M*y[BRANCH_VARIABLES[i]] <= self.OBJ[i]
+                    except:
+                        interdict_prob += self.MAT.getcol(i).transpose()*u + w[FREE_VARIABLES[i]] <= self.OBJ[i]
+            for (i, j) in enumerate(sense):
+                if (self.SENSE[0] == 'Max' and j == '<=' or self.SENSE[0] == 'Min' and j == '>='):
+                    interdict_prob += u[i] >= 0
+                elif j != '=':
+                    interdict_prob += u[i] <= 0
+            if (self.SENSE[0] == 'Max'):
+                interdict_prob += w >= 0
+            else:
+                interdict_prob += w <= 0                
+            interdict_prob += 0 <= y <= np.ones(len(BRANCH_VARIABLES))
+            lp = CyClpSimplex(interdict_prob)
+            lp.writeMps('interdict.mps')
+            cbcModel = lp.getCbcModel()
+            #cbcModel.logLevel = 0
+            cbcModel.maximumSeconds = 100
+            cbcModel.solve()
+            if cbcModel.status == 'solution' or cbcModel.status == 'stopped on time':
                 if debug_print:
-                    print "Cons Dual Vars:"
-                    for i in cons_dual_vars:
-                        print i, cons_dual_vars[i].varValue
-                    print "Bound Dual Vars:"
-                    for i in bound_dual_vars:
-                        print i, bound_dual_vars[i].varValue
-                    print "Interdiction Vars:"
-                    for i in interdict_vars:
-                        print i, interdict_vars[i].varValue
+                    print "Cons Dual Vars:", cbcModel.primalVariableSolution['u']
+                    print "Bound Dual Vars:", cbcModel.primalVariableSolution['w']
+                    print "Interdiction Vars:", cbcModel.primalVariableSolution['y']
                     print "Value of all zeros solution:",
-                    print value(lpSum(cons_dual_vars[i]*self.ADJ_RHS[i] for i in self.CONSTRAINTS) 
-                                + lpSum(bound_dual_vars[j] for j in FREE_VARIABLES) + OBJ_OFFSET)
-                branch_var_list = [i for i in interdict_vars if interdict_vars[i].varValue > 0.5]
+                    print np.dot(cbcModel.primalVariableSolution['u'], self.ADJ_RHS) + cbcModel.primalVariableSolution['w'].sum() + OBJ_OFFSET
+                branch_var_list = [i for i in BRANCH_VARIABLES if cbcModel.primalVariableSolution['y'][BRANCH_VARIABLES[i]] > 0.5]
                 found_ISC = True
         if found_ISC is False:
             #most fractional variable
             if self.branch_strategy is INTERDICTION_BRANCHING:
                 print "Falling back to fractional branching"
-            min_frac = -1
-            for i in FREE_VARIABLES:
-                frac = min(self.var[i].varValue-math.floor(self.var[i].varValue),
-                           math.ceil(self.var[i].varValue)- self.var[i].varValue)
-                if (frac> min_frac):
-                    min_frac = frac
-                    branch_var_list = [i]
+            branch_var = int(np.argmax(np.abs(np.around(self.sol)-self.sol)))
+            if etol < self.sol[branch_var] < 1 - etol:
+                branch_var_list = [branch_var]
         print "Branching on set:"
         print branch_var_list
         
@@ -504,8 +515,7 @@ class InterdictionTree(Tree):
             branch_var_set[branch_var_list[i]] = 1
             for j in range(i):
                 branch_var_set[branch_var_list[j]] = 0
-            self.Q.push(self.node_count, (self.node_count, parent, 
-                                          bound, branch_var_set), priority)
+            self.Q.push(self.node_count, priority, (self.node_count, parent, bound, branch_var_set))
             self.node_count += 1
             self.real_node_count += 1
         if found_ISC is False:
@@ -513,31 +523,92 @@ class InterdictionTree(Tree):
             branch_var_set = {}
             for i in branch_var_list:
                 branch_var_set[i] = 0
-            self.Q.push(self.node_count, (self.node_count, parent, 
-                                          bound, branch_var_set), priority)
+            self.Q.push(self.node_count, priority, (self.node_count, parent, bound, branch_var_set))
             self.node_count += 1
             self.real_node_count += 1
         if found_ISC is True and len(branch_var_set) == 1:
             self.real_node_count -= 1
             
+def isInt(x):
+    '''
+    Return True if x is an integer, or if x is a numpy array
+    with all integer elements, False otherwise
+    '''
+    if isinstance(x, (int, long, float)):
+        return abs(math.floor(x) - x) < 1e-6
+    return (np.abs(np.around(x) - x) < 1e-6).all()
+
+def read_instance(module_name = None, file_name = None):
+
+    if module_name is not None:
+        mip = ilib.import_module(module_name)
+        return np.matrix(mip.A), np.ndarray(mip.b), mip.c, mip.sense, mip.integerIndices
+    elif file_name is not None:
+        m = CyClpSimplex()
+        m.readMps(file_name)
+        mat = m.matrix
+        A = sparse.csc_matrix((mat.elements, mat.indices, mat.vectorStarts),
+                              shape=(m.nConstraints, m.nVariables)).tocsr()
+        integerIndices = [i for (i, j) in enumerate(m.integerInformation) if j == True]
+        INFINITY = m.getCoinInfinity()
+        sense = []
+        b = []
+        for i in range(m.nConstraints):
+            if m.constraintsLower[i] > -INFINITY:
+                if m.constraintsUpper[i] >= INFINITY:
+                    sense.append('>=')
+                elif m.constraintsLower[i] == m.constraintsUpper[i]:
+                    sense.append('=')
+                else:
+                    print "Function does not support ranged constraint..."
+                b.append(m.constraintsLower[i])
+            elif m.constraintsUpper[i] < INFINITY:
+                sense.append('>=')
+                b.append(-m.constraintsUpper[i])
+                for idx in range(A.indptr[i], A.indptr[i+1]):
+                    A.data[idx] = -A.data[idx]
+            else:
+                print "Error: Free constraint..."
+                break
+        return A.tocsc(), b, m.objectiveCoefficients, sense, integerIndices
+    else:
+        print "No file or module name specified..."
+        return None, None, None, None, None, None
     
 if __name__ == '__main__':
-#    '''
-    T = InterdictionTree()
-    T.set_display_mode('xdot')
-    
-    numV = 40
-    numC = 20
-    VARS = range(numV)
-    CONS = ["C"+str(i) for i in range(numC)]
+    generate_instance = False
 
-    #Generate random MILP
-    T.GenerateRandomMILP(VARS, CONS, rand_seed = 2)
-    #T.branch_on_fractional = False
-    T.branch_strategy = MOST_FRACTIONAL
-    #T.incumbent_value = 213
-    T.BranchAndBound()
-#    '''
+    T = InterdictionTree()
+    T.set_display_mode('off')
+    T.branch_strategy = INTERDICTION_BRANCHING
+    #T.branch_strategy = MOST_FRACTIONAL
+    
+    if generate_instance:
+        numV = 40
+        numC = 20
+        VARS = range(numV)
+        CONS = ["C"+str(i) for i in range(numC)]
+
+        #Generate random MILP
+        T.GenerateRandomMILP(VARS, CONS, rand_seed = 2)
+        #T.branch_on_fractional = False
+    else:
+        path = 'C:\\cygwin64\\home\\ted\\Data\\miplib2010-1.0.4\\instances\\miplib2010\\'
+        #T.MAT, T.RHS, T.OBJ, sense, T.IntegerIndices = read_instance(file_name = path + 'acc-tight5.mps')
+        #T._incumbent_value = 1
+        #T.MAT, T.RHS, T.OBJ, sense, T.IntegerIndices = read_instance(file_name = path + 'eilB101.mps')
+        #T._incumbent_value = 1218
+        #T.MAT, T.RHS, T.OBJ, sense, T.IntegerIndices = read_instance(file_name = path + 'eil33-2.mps')
+        #T._incumbent_value = 935
+        T.MAT, T.RHS, T.OBJ, sense, T.IntegerIndices = read_instance(file_name = path + 'cov1075.mps')
+        T._incumbent_value = 20
+        #T.MAT, T.RHS, T.OBJ, sense, T.IntegerIndices = read_instance(file_name = 'p0033.mps')
+        #T._incumbent_value = 3090
+        #T.MAT, T.RHS, T.OBJ, sense, T.IntegerIndices = read_instance(file_name = path + 'iis-bupa-cov.mps')
+        #T._incumbent_value = 36
+        T.SENSE = ('Min', sense)
+        
+    T.BranchAndBound(max_iter_num = 1, debug_print = True)
 '''
     numV = 40
     numC = 20
